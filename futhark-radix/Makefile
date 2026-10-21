@@ -1,15 +1,13 @@
-default: test
+.PHONY: test bench clean
 
-primes-seq:
-	futhark c primes-seq.fut
+test:
+	futhark test --backend=cuda radix.fut
 
-test: radix.fut ref10000000.out
-	futhark test --backend=cuda $<
-
-ref10000000.out: primes-seq
-	echo "10000000i64" | ./$< -b > $@
-
+bench:
+	futhark dataset --i32-bounds=0:9 -g '[100]i32' > dataset1.in
+	futhark dataset --i32-bounds=0:9 -g '[10000]i32' > dataset2.in
+	futhark dataset --i32-bounds=0:9 -g '[1000000]i32' > dataset3.in
+	futhark dataset --i32-bounds=0:9 -g '[100000000]i32' > dataset4.in
+	futhark bench --backend=cuda radix.fut
 clean:
-	# rm -rf ref10000000.out
-	rm -rf *.c primes-flat primes-seq primes-naive primes-adhoc
-	rm -rf *.actual *.expected
+	rm -rf *.c *.h *.json radix *.actual *.expected dataset*.in
