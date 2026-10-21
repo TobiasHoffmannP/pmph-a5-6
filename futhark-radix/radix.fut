@@ -1,11 +1,10 @@
+import "lib/github.com/diku-dk/sorts/radix_sort"
 -- Primes: Flat-Parallel Version
 -- ==
--- compiled input { 30i64 }
--- output { [2i64, 3i64, 5i64, 7i64, 11i64, 13i64, 17i64, 19i64, 23i64, 29i64] }
--- compiled input { 10000000i64 }
--- output @ ref10000000.out
+-- input { [9,8,7,6,5,4,3,2,1] }
+-- output {[1,2,3,4,5,6,7,8,9]}
+-- compiled input @ dataset.in
+-- output @ dataset.out
 
-
-
-
-let main (n: []i32) : []i32 = radixSort n 
+let main (n: []i32) : []i32 = 
+    radix_sort i32.num_bits i32.get_bit n
