@@ -18,7 +18,7 @@ RADIX_FUTHARK_DIR = futhark-radix
 FUTHARK_SRC = $(RADIX_FUTHARK_DIR)/radix.fut
 FUTHARK_EXECUTABLE = $(RADIX_FUTHARK_DIR)/radix
 
-DATASET_SIZES = 10 100 10000 100000000
+DATASET_SIZES = 10 100 10000
 
 benchmark: bench-futhark bench-cub bench-cuda
 
