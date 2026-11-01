@@ -13,7 +13,7 @@ typedef long long  int64_t;
 #endif
 
 typedef unsigned int uint32_t;
-typedef unsigned long long uint64_t;
+// typedef unsigned long long uint64_t;
 
 
 int gpuAssert(cudaError_t code) {

@@ -9,12 +9,13 @@
 
 #define GPU_RUNS 100
 #define UINT_SIZE_BITS sizeof(unsigned int)*8
+#define BLOCK_SIZE 256
+#define ELM_PER_THREAD 22
+#define BITS 8
 
 __global__ void createHistogram(unsigned int* global_in, unsigned int* global_hist,
-                                unsigned int i, unsigned int elm_per_thread,
-                                unsigned int hist_size, unsigned int bits,
-                                unsigned int tile_size, unsigned int num_blocks, 
-				unsigned int N) {
+                                unsigned int i, unsigned int hist_size, unsigned int N,
+                                unsigned int tile_size, unsigned int num_blocks) {
     extern __shared__ unsigned int shmem[];
     unsigned int* hist = shmem;
     unsigned int* tile = shmem + hist_size;
@@ -30,11 +31,11 @@ __global__ void createHistogram(unsigned int* global_in, unsigned int* global_hi
     }
     __syncthreads();
 
-    for (unsigned int j = 0; j < elm_per_thread; j++) {
-        unsigned int idx = threadIdx.x * elm_per_thread + j;
+    for (unsigned int j = 0; j < ELM_PER_THREAD; j++) {
+        unsigned int idx = threadIdx.x * ELM_PER_THREAD + j;
         if (tile_start + idx < N) {
             unsigned int elm = tile[idx];
-            unsigned int segmented_bits = (elm >> (i * bits)) & (hist_size - 1);
+            unsigned int segmented_bits = (elm >> (i * BITS)) & (hist_size - 1);
             atomicAdd(&hist[segmented_bits], 1);
         }
     }
@@ -45,16 +46,17 @@ __global__ void createHistogram(unsigned int* global_in, unsigned int* global_hi
         global_hist[j * num_blocks + blockIdx.x] = hist[j];
 }
 
-
-__global__ void sortFromHistogram(unsigned int* global_in, unsigned int i,
-				  unsigned int elm_per_thread, unsigned int hist_size, 
-				  unsigned int block_size, unsigned int bits, 
-				  unsigned int tile_size) {
+__global__ void sortFromHistogram(unsigned int* global_in, unsigned int* global_out, unsigned int* global_hist,
+          unsigned int* global_hist_scanned, unsigned int i,
+				  unsigned int hist_size, unsigned int N,
+				  unsigned int tile_size, unsigned int num_blocks) {
     using BlockScan = cub::BlockScan<unsigned, BLOCK_SIZE>;
     __shared__ typename BlockScan::TempStorage scan_tmp;
 
     extern __shared__ unsigned int shmem[];
     unsigned int* tile = shmem;
+    unsigned int* s_hist = shmem + tile_size;
+    unsigned int* s_hist_scanned = shmem + tile_size + hist_size;
 
     unsigned int tile_start = blockIdx.x * tile_size;
 
@@ -66,62 +68,88 @@ __global__ void sortFromHistogram(unsigned int* global_in, unsigned int i,
     __syncthreads();
 
     // copy from shared to register memory
-    unsigned int key[elm_per_thread];
+    unsigned int key[ELM_PER_THREAD];
     #pragma unroll
-    for (unsigned int q = 0; q < elm_per_thread; q++)
-        key[q] = tile[threadIdx.x * elm_per_thread + q];
+    for (unsigned int q = 0; q < ELM_PER_THREAD; q++)
+        key[q] = tile[threadIdx.x * ELM_PER_THREAD + q];
     __syncthreads();
     
     // bit-wise sorting
-    for (unsigned int j = 0; j < bits; j++) {
-    	unsigned int bit_idx = i * bits + j;
+    for (unsigned int j = 0; j < BITS; j++) {
+        unsigned int bit_idx = i * BITS + j;
 	
-	bool flag[elm_per_thread], prefix_sum[elm_per_thread];
+        unsigned int flag[ELM_PER_THREAD], prefix_sum[ELM_PER_THREAD];
 	
-	// generate flag array
-	#pragma unroll
-	for (unsigned int q = 0; q < elm_per_thread; q++) 
-	    flag[q] = ((key[q] >> bit_idx) & 1u) == 0; // predicate true if bit in position bit_idx is unset
-	
-	// exclusive scan to find prefix sum of flag array
-	unsigned int numTrue;
+        // generate flag array
+        #pragma unroll
+        for (unsigned int q = 0; q < ELM_PER_THREAD; q++) 
+            flag[q] = ((key[q] >> bit_idx) & 1u) == 0; // predicate true if bit in position bit_idx is unset
+
+        // exclusive scan to find prefix sum of flag array
+        unsigned int numTrue;
         BlockScan(scan_tmp).ExclusiveSum(flag, prefix_sum, numTrue);
         __syncthreads();
 
         #pragma unroll
-        for (unsigned int q = 0; q < elm_per_thread; q++) {
-            unsigned int i = threadIdx.x * elm_per_thread + q;
+        for (unsigned int q = 0; q < ELM_PER_THREAD; q++) {
+            unsigned int i = threadIdx.x * ELM_PER_THREAD + q;
             unsigned int dest = flag[q] ? prefix_sum[q] : numTrue + (i - prefix_sum[q]);
             tile[dest] = key[q];
         }
         __syncthreads();
+
+        #pragma unroll                                   // (5) reload in new order
+        for (unsigned int q = 0; q < ELM_PER_THREAD; q++)
+            key[q] = tile[threadIdx.x * ELM_PER_THREAD + q];
+
+        __syncthreads();
     }
     // TODO: Step 3 in the last kernel from the hint:)
+    for (unsigned int j = threadIdx.x; j < hist_size; j += blockDim.x) {
+        s_hist[j] = global_hist[j * num_blocks + blockIdx.x];
+        s_hist_scanned[j] = global_hist_scanned[j * num_blocks + blockIdx.x];
+    }
+    // BlockScan(scan_tmp).ExclusiveSum(s_hist, s_hist);
+    // __syncthreads();
+
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        unsigned int sum = 0;
+        for (unsigned int j = 0; j < hist_size; j++) {
+            unsigned int v = s_hist[j];
+            s_hist[j] = sum;
+            sum += v;
+        }
+    }
+    __syncthreads();
+
+    unsigned int valid = min(tile_size, N - tile_start);
+
+    for (unsigned int q = 0; q < ELM_PER_THREAD; q++) {
+        unsigned int idx = threadIdx.x * ELM_PER_THREAD + q;
+        if (idx >= valid) continue;
+        unsigned int elm   = tile[idx];
+        unsigned int digit = (elm >> (i * BITS)) & (hist_size - 1);
+        unsigned int global_dest = s_hist_scanned[digit] + (idx - s_hist[digit]);
+        global_out[global_dest] = elm;
+    }    
 }
 
 int main(int argc, char** argv) {
     unsigned int N;
-    unsigned int BLOCK_SIZE;
-    unsigned int BITS;
-    unsigned int ELM_PER_THREAD;
+    unsigned int BOUND;
     
     { // reading the number of elements 
-      if (argc != 5) { 
+      if (argc != 3) { 
         printf("Num Args is: %d instead of 4. Exiting!\n", argc); 
         exit(1);
       }
 
       N = atoi(argv[1]);
-      printf("N is: %d\n", N);
+      printf("N is: %d\n",N);
 
-      BLOCK_SIZE = atoi(argv[2]);
-      printf("block size is: %d\n", BLOCK_SIZE);
-
-      BITS = atoi(argv[3]);
-      printf("number of bits is: %d\n", BITS);
-
-      ELM_PER_THREAD = atoi(argv[4]);
-      printf("number of elements per thread: %d\n", ELM_PER_THREAD);
+      BOUND = atoi(argv[2]);
+      printf("Upper bound is: %d\n", BOUND);
 
       const unsigned int maxN = 500000000;
       if(N > maxN) {
@@ -131,67 +159,78 @@ int main(int argc, char** argv) {
     }
 
     unsigned int TILE_SIZE = ELM_PER_THREAD*BLOCK_SIZE;
-    unsigned int NUM_BLOCKS = (unsigned int)ceil(N/TILE_SIZE);
+    unsigned int NUM_BLOCKS = (N + TILE_SIZE - 1) / TILE_SIZE;
     unsigned int HIST_SIZE = pow(2,BITS);
-    unsigned int = GLOBAL_HIST_SIZE = NUM_BLOCKS*HIST_SIZE*sizeof(unsigned int)
+    unsigned int HIST_ELMS = NUM_BLOCKS*HIST_SIZE;
+    size_t HIST_BYTES = HIST_ELMS*sizeof(unsigned int);
+    unsigned int ITERATIONS = (unsigned int)ceil(UINT_SIZE_BITS/BITS);
     unsigned int shmem_size = (HIST_SIZE + TILE_SIZE) * sizeof(unsigned int);
+    unsigned int shmem_size_sort = (2*HIST_SIZE + TILE_SIZE) * sizeof(unsigned int);
+
+    printf("TILE_SIZE: %d, NUM_BLOCK: %d, HIST_SIZE: %d, G_HIST_SIZE: %d, ITTERS: %d\n", TILE_SIZE, NUM_BLOCKS, HIST_SIZE, HIST_ELMS, ITERATIONS);
     // use the first CUDA device:
     cudaSetDevice(0);
 
     // allocate host memory
-    unsigned int* h_in  = (unsigned int*) malloc(N*sizeof(unsigned int));
-    unsigned int* h_out = (unsigned int*) malloc(NUM_BLOCKS*pow(2,BITS)*sizeof(unsigned int));
+    unsigned int* h_in  = (unsigned int*)createInput(N, (unsigned long)BOUND);
+    unsigned int* h_out = (unsigned int*) malloc(N*sizeof(unsigned int));
 
     // initialize the memory
     for(unsigned int i=0; i<N; ++i) {
         h_in[i] = i % 4;
     }
+    unsigned int *d_in, *d_out, *d_hist, *d_hist_scanned;
+    cudaMalloc(&d_in,  N * sizeof(unsigned int));
+    cudaMalloc(&d_out, N * sizeof(unsigned int));
+    cudaMalloc(&d_hist,         HIST_BYTES);
+    cudaMalloc(&d_hist_scanned, HIST_BYTES);
 
-    // allocate device memory
-    unsigned int* d_in;
-    unsigned int* d_hist;
-    unsigned int* d_hist_scanned;
-    cudaMalloc((void**)&d_in, N*sizeof(unsigned int));
-    cudaMalloc((void**)&d_hist, GLOBAL_HIST_SIZE);
-    cudaMalloc((void**)&d_hist_scanned, GLOBAL_HIST_SIZE);
-    void*  d_temp     = nullptr;
+    // allocate CUB temp storage once, outside the timing
+    void* d_temp = nullptr; size_t temp_bytes = 0;
+    cub::DeviceScan::ExclusiveSum(d_temp, temp_bytes, d_hist, d_hist_scanned, HIST_ELMS);
+    cudaMalloc(&d_temp, temp_bytes);
 
-    // copy host memory to device
-    cudaMemcpy(d_in, h_in, N*sizeof(unsigned int), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_in, h_in, N * sizeof(unsigned int), cudaMemcpyHostToDevice);
     {
         double elapsed; struct timeval t_start, t_end, t_diff;
         gettimeofday(&t_start, NULL);
 
-        
-	createHistogram<<<NUM_BLOCKS, BLOCK_SIZE, shmem_size>>>(d_in, d_hist, 0, ELM_PER_THREAD, pow(2,BITS), BITS, TILE_SIZE, NUMB_BLOCKS, N);
-	
-	// scan historgram
-	size_t temp_bytes = 0;
-	cub::DeviceScan::ExclusiveSum(d_temp, temp_bytes, d_hist, d_hist_scanned, GLOBAL_HIST_SIZE)
-	cudaMalloc(&d_temp, temp_bytes);
-	cub::DeviceScan::ExclusiveSum(d_temp, temp_bytes, d_hist, d_hist_scanned, GLOBAL_HIST_SIZE)
 
+        for (unsigned int i = 0; i < ITERATIONS; i++) {
+            createHistogram<<<NUM_BLOCKS, BLOCK_SIZE, shmem_size>>>(
+                d_in, d_hist, i, HIST_SIZE, N, TILE_SIZE, NUM_BLOCKS);
+            gpuAssert(cudaGetLastError());
 
-	cudaDeviceSynchronize();
+            cub::DeviceScan::ExclusiveSum(d_temp, temp_bytes, d_hist, d_hist_scanned, HIST_ELMS);
+
+            sortFromHistogram<<<NUM_BLOCKS, BLOCK_SIZE, shmem_size_sort>>>(
+                d_in, d_out, d_hist, d_hist_scanned, i, HIST_SIZE, N, TILE_SIZE, NUM_BLOCKS);
+            gpuAssert(cudaGetLastError());
+
+            std::swap(d_in, d_out);
+        }
+
+        cudaDeviceSynchronize();
+
+        cudaMemcpy(h_out, d_in, N * sizeof(unsigned int), cudaMemcpyDeviceToHost); 
         
         gettimeofday(&t_end, NULL);
         timeval_subtract(&t_diff, &t_end, &t_start);
         elapsed = (1.0 * (t_diff.tv_sec*1e6+t_diff.tv_usec)) / GPU_RUNS;
         double gigabytespersec = (2.0 * N * 4.0) / (elapsed * 1000.0);
         printf("The kernel took on average %f microseconds. GB/sec: %f \n", elapsed, gigabytespersec);
-        
     }
         
     // check for errors
     gpuAssert( cudaPeekAtLastError() );
 
     // copy result from ddevice to host
-    cudaMemcpy(h_out, d_hist, NUM_BLOCKS*pow(2,BITS)*sizeof(unsigned int), cudaMemcpyDeviceToHost);
-    for (unsigned int b = 0; b < NUM_BLOCKS; b++) {
-        for (unsigned int j = 0; j < HIST_SIZE; j++) {
-                printf("result at block %d, bin %d: actual %d\n",
-                       b, j, h_out[b * HIST_SIZE + j]);
-        }
+    // cudaMemcpy(h_out, d_hist, NUM_BLOCKS*pow(2,BITS)*sizeof(unsigned int), cudaMemcpyDeviceToHost);
+    for (unsigned int b = 1; b < N; b++) {
+            if (h_out[b-1] > h_out[b]) {
+                printf("INVALID RESULT for i:%d, (A[i-1]=%d > A[i]=%d)\n", b, h_out[b-1], h_out[b]);
+                return 1;
+            }
     }
     printf("Successful Validation.\n");
 
