@@ -5,9 +5,6 @@ CXX	= nvcc -O3
 RADIX_CUDA_DIR = cuda-radix
 CUDA_SRC = $(RADIX_CUDA_DIR)/radix.cu
 CUDA_EXECUTABLE = $(RADIX_CUDA_DIR)/radix
-BLOCK_SIZE = 2
-NUM_OF_BITS = 2
-ELM_PER_THREAD = 4
 
 CUB=cub-1.8.0
 RADIX_CUB_DIR = cub-code-radixsort
@@ -21,8 +18,8 @@ FUTHARK_EXECUTABLE = $(RADIX_FUTHARK_DIR)/radix
 BENCH_HELPER = bench-helper.cu
 BENCH_HELPER_EXECUTABLE = bench-helper
 
-DATASET_SIZES = 10 100
-DATASET_RANGE = 10 100 # Max possible value for the datasets
+DATASET_SIZES = 10 100 1000000 10000000 276447232
+DATASET_RANGE = 10 100 10000 10000 100000 # Max possible value for the elements in the datasets [0:DATASET_RANGE]
 
 benchmark: bench-futhark bench-cub bench-cuda
 
@@ -47,7 +44,7 @@ bench-cub: compile-cub
 #CUDA
 bench-cuda: compile-cuda
 	@echo "--Running CUDA benchmark with sizes: $(DATASET_SIZES)--"
-	@$(foreach i,$(shell seq 1 $(words $(DATASET_SIZES))),$(CUDA_EXECUTABLE) $(word $(i),$(DATASET_SIZES)) $(word $(i),$(DATASET_RANGE)) $(BLOCK_SIZE) $(NUM_OF_BITS) $(ELM_PER_THREAD);)
+	@$(foreach i,$(shell seq 1 $(words $(DATASET_SIZES))),$(CUDA_EXECUTABLE) $(word $(i),$(DATASET_SIZES)) $(word $(i),$(DATASET_RANGE));)
 
 compile-cuda: $(CUDA_EXECUTABLE)
 $(CUDA_EXECUTABLE): $(CUDA_SRC) bench-helper.o

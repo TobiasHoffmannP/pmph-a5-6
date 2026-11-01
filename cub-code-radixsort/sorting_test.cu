@@ -50,21 +50,28 @@ double sortRedByKeyCUB( uint32_t* data_keys_in
 
     // timing
     double elapsed;
-    struct timeval t_start, t_end, t_diff;
-    gettimeofday(&t_start, NULL);
+    cudaEvent_t ev_start, ev_stop;
+    cudaEventCreate(&ev_start);
+    cudaEventCreate(&ev_stop);
+    float total_ms = 0.0f;
 
-    for(int k=0; k<GPU_RUNS; k++) {
-        cub::DeviceRadixSort::SortKeys( tmp_sort_mem, tmp_sort_len
-                                      , data_keys_in, data_keys_out
-                                      , N,   beg_bit,  end_bit
-                                      );
+    for (int k = 0; k < GPU_RUNS; k++) {
+        cudaEventRecord(ev_start);
+        cub::DeviceRadixSort::SortKeys(tmp_sort_mem, tmp_sort_len,
+                                    data_keys_in, data_keys_out,
+                                    N, beg_bit, end_bit);
+        cudaEventRecord(ev_stop);
+        cudaEventSynchronize(ev_stop);
+
+        float ms;
+        cudaEventElapsedTime(&ms, ev_start, ev_stop);
+        total_ms += ms;
     }
-    cudaDeviceSynchronize();
     cudaCheckError();
+    cudaEventDestroy(ev_start);
+    cudaEventDestroy(ev_stop);
 
-    gettimeofday(&t_end, NULL);
-    timeval_subtract(&t_diff, &t_end, &t_start);
-    elapsed = (t_diff.tv_sec*1e6+t_diff.tv_usec) / ((double)GPU_RUNS);
+    elapsed = (total_ms * 1000.0) / GPU_RUNS;   // microseconds
 
     cudaFree(tmp_sort_mem);
 

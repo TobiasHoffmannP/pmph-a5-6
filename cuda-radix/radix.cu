@@ -6,11 +6,12 @@
 #include <cub/cub.cuh>
 
 #include "helper.h"
+#include "../bench-helper.h"
 
-#define GPU_RUNS 100
+#define GPU_RUNS 400
 #define UINT_SIZE_BITS sizeof(unsigned int)*8
 #define BLOCK_SIZE 256
-#define ELM_PER_THREAD 22
+#define ELM_PER_THREAD 23
 #define BITS 8
 
 __global__ void createHistogram(unsigned int* global_in, unsigned int* global_hist,
@@ -26,18 +27,18 @@ __global__ void createHistogram(unsigned int* global_in, unsigned int* global_hi
     for (unsigned int j = threadIdx.x; j < hist_size; j += blockDim.x)
         hist[j] = 0;
     for (unsigned int j = threadIdx.x; j < tile_size; j += blockDim.x) {
-        unsigned int g = tile_start + j;
-        tile[j] = (g < N) ? global_in[g] : 0;
+       unsigned int g = tile_start + j;
+       tile[j] = (g < N) ? global_in[g] : 0;
     }
     __syncthreads();
 
     for (unsigned int j = 0; j < ELM_PER_THREAD; j++) {
-        unsigned int idx = threadIdx.x * ELM_PER_THREAD + j;
-        if (tile_start + idx < N) {
-            unsigned int elm = tile[idx];
-            unsigned int segmented_bits = (elm >> (i * BITS)) & (hist_size - 1);
-            atomicAdd(&hist[segmented_bits], 1);
-        }
+       unsigned int idx = threadIdx.x * ELM_PER_THREAD + j;
+       if (tile_start + idx < N) {
+           unsigned int elm = tile[idx];
+           unsigned int segmented_bits = (elm >> (i * BITS)) & (hist_size - 1);
+           atomicAdd(&hist[segmented_bits], 1);
+       }
     }
     __syncthreads();
     
@@ -126,7 +127,7 @@ __global__ void sortFromHistogram(unsigned int* global_in, unsigned int* global_
     unsigned int valid = min(tile_size, N - tile_start);
 
     for (unsigned int q = 0; q < ELM_PER_THREAD; q++) {
-        unsigned int idx = threadIdx.x * ELM_PER_THREAD + q;
+        unsigned int idx = q * BLOCK_SIZE + threadIdx.x;
         if (idx >= valid) continue;
         unsigned int elm   = tile[idx];
         unsigned int digit = (elm >> (i * BITS)) & (hist_size - 1);
@@ -146,10 +147,8 @@ int main(int argc, char** argv) {
       }
 
       N = atoi(argv[1]);
-      printf("N is: %d\n",N);
 
       BOUND = atoi(argv[2]);
-      printf("Upper bound is: %d\n", BOUND);
 
       const unsigned int maxN = 500000000;
       if(N > maxN) {
@@ -167,7 +166,7 @@ int main(int argc, char** argv) {
     unsigned int shmem_size = (HIST_SIZE + TILE_SIZE) * sizeof(unsigned int);
     unsigned int shmem_size_sort = (2*HIST_SIZE + TILE_SIZE) * sizeof(unsigned int);
 
-    printf("TILE_SIZE: %d, NUM_BLOCK: %d, HIST_SIZE: %d, G_HIST_SIZE: %d, ITTERS: %d\n", TILE_SIZE, NUM_BLOCKS, HIST_SIZE, HIST_ELMS, ITERATIONS);
+    //printf("TILE_SIZE: %d, NUM_BLOCK: %d, HIST_SIZE: %d, G_HIST_SIZE: %d, ITTERS: %d\n", TILE_SIZE, NUM_BLOCKS, HIST_SIZE, HIST_ELMS, ITERATIONS);
     // use the first CUDA device:
     cudaSetDevice(0);
 
@@ -175,10 +174,6 @@ int main(int argc, char** argv) {
     unsigned int* h_in  = (unsigned int*)createInput(N, (unsigned long)BOUND);
     unsigned int* h_out = (unsigned int*) malloc(N*sizeof(unsigned int));
 
-    // initialize the memory
-    for(unsigned int i=0; i<N; ++i) {
-        h_in[i] = i % 4;
-    }
     unsigned int *d_in, *d_out, *d_hist, *d_hist_scanned;
     cudaMalloc(&d_in,  N * sizeof(unsigned int));
     cudaMalloc(&d_out, N * sizeof(unsigned int));
@@ -191,11 +186,36 @@ int main(int argc, char** argv) {
     cudaMalloc(&d_temp, temp_bytes);
 
     cudaMemcpy(d_in, h_in, N * sizeof(unsigned int), cudaMemcpyHostToDevice);
-    {
-        double elapsed; struct timeval t_start, t_end, t_diff;
-        gettimeofday(&t_start, NULL);
 
+    // Dry run
+    for (unsigned int i = 0; i < ITERATIONS; i++) {
+        createHistogram<<<NUM_BLOCKS, BLOCK_SIZE, shmem_size>>>(
+            d_in, d_hist, i, HIST_SIZE, N, TILE_SIZE, NUM_BLOCKS);
+        gpuAssert(cudaGetLastError());
 
+        cub::DeviceScan::ExclusiveSum(d_temp, temp_bytes, d_hist, d_hist_scanned, HIST_ELMS);
+
+        sortFromHistogram<<<NUM_BLOCKS, BLOCK_SIZE, shmem_size_sort>>>(
+            d_in, d_out, d_hist, d_hist_scanned, i, HIST_SIZE, N, TILE_SIZE, NUM_BLOCKS);
+        gpuAssert(cudaGetLastError());
+
+        std::swap(d_in, d_out);
+    }
+    cudaDeviceSynchronize();
+
+    
+    double elapsed;
+    cudaEvent_t ev_start, ev_stop;
+    cudaEventCreate(&ev_start);
+    cudaEventCreate(&ev_stop);
+    float total_ms = 0.0f;
+
+    for (int k = 0; k < GPU_RUNS; k++) {
+        // restore random input (not timed)
+        cudaMemcpy(d_in, h_in, N * sizeof(unsigned int), cudaMemcpyHostToDevice);
+        cudaDeviceSynchronize();
+
+        cudaEventRecord(ev_start);
         for (unsigned int i = 0; i < ITERATIONS; i++) {
             createHistogram<<<NUM_BLOCKS, BLOCK_SIZE, shmem_size>>>(
                 d_in, d_hist, i, HIST_SIZE, N, TILE_SIZE, NUM_BLOCKS);
@@ -209,30 +229,32 @@ int main(int argc, char** argv) {
 
             std::swap(d_in, d_out);
         }
+        cudaEventRecord(ev_stop);
+        cudaEventSynchronize(ev_stop);
 
-        cudaDeviceSynchronize();
-
-        cudaMemcpy(h_out, d_in, N * sizeof(unsigned int), cudaMemcpyDeviceToHost); 
-        
-        gettimeofday(&t_end, NULL);
-        timeval_subtract(&t_diff, &t_end, &t_start);
-        elapsed = (1.0 * (t_diff.tv_sec*1e6+t_diff.tv_usec)) / GPU_RUNS;
-        double gigabytespersec = (2.0 * N * 4.0) / (elapsed * 1000.0);
-        printf("The kernel took on average %f microseconds. GB/sec: %f \n", elapsed, gigabytespersec);
+        float ms;
+        cudaEventElapsedTime(&ms, ev_start, ev_stop);
+        total_ms += ms;
     }
+
+    cudaMemcpy(h_out, d_in, N * sizeof(unsigned int), cudaMemcpyDeviceToHost);
+    cudaEventDestroy(ev_start);
+    cudaEventDestroy(ev_stop);
+
+    // Check validation, if invalid program exits with an error message
+    for (unsigned int b = 1; b < N; b++) {
+        if (h_out[b-1] > h_out[b]) {
+            printf("INVALID RESULT for i:%d, (A[i-1]=%u > A[i]=%u)\n", b, h_out[b-1], h_out[b]);
+            return 1;
+        }
+    }
+
+    elapsed = (total_ms * 1000.0) / GPU_RUNS;   // microseconds per run
+    double gigabytespersec = (2.0 * N * 4.0) / (elapsed * 1000.0);
+    printf("CUDA Sorting for N=%u, runs in: %f us, GB/sec: %f, VALID: 1\n", N, elapsed, gigabytespersec);
         
     // check for errors
     gpuAssert( cudaPeekAtLastError() );
-
-    // copy result from ddevice to host
-    // cudaMemcpy(h_out, d_hist, NUM_BLOCKS*pow(2,BITS)*sizeof(unsigned int), cudaMemcpyDeviceToHost);
-    for (unsigned int b = 1; b < N; b++) {
-            if (h_out[b-1] > h_out[b]) {
-                printf("INVALID RESULT for i:%d, (A[i-1]=%d > A[i]=%d)\n", b, h_out[b-1], h_out[b]);
-                return 1;
-            }
-    }
-    printf("Successful Validation.\n");
 
     // clean-up memory
     free(h_in);
