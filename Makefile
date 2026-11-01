@@ -18,10 +18,17 @@ RADIX_FUTHARK_DIR = futhark-radix
 FUTHARK_SRC = $(RADIX_FUTHARK_DIR)/radix.fut
 FUTHARK_EXECUTABLE = $(RADIX_FUTHARK_DIR)/radix
 
-DATASET_SIZES = 10 100 10000
+BENCH_HELPER = bench-helper.cu
+BENCH_HELPER_EXECUTABLE = bench-helper
+
+DATASET_SIZES = 10 100
+DATASET_RANGE = 10 100 # Max possible value for the datasets
 
 benchmark: bench-futhark bench-cub bench-cuda
 
+# bench helper
+bench-helper.o: bench-helper.cu bench-helper.h
+	$(CXX) -c bench-helper.cu -o bench-helper.o
 
 # Futhark
 bench-futhark:
@@ -30,22 +37,21 @@ bench-futhark:
 
 # CUB
 compile-cub: $(CUB_EXECUTABLE)
-$(CUB_EXECUTABLE): $(CUB_SRC)
-	$(CXX) -o $(CUB_EXECUTABLE) $(CUB_SRC)
+$(CUB_EXECUTABLE): $(CUB_SRC) bench-helper.o
+	$(CXX) -I$(CUB) -I. -o $(CUB_EXECUTABLE) $(CUB_SRC) bench-helper.o
 
 bench-cub: compile-cub
 	@echo "--Running CUB benchmark with sizes: $(DATASET_SIZES)--"
-	@$(foreach size, $(DATASET_SIZES), $(CUB_EXECUTABLE) $(size);)
+	@$(foreach i,$(shell seq 1 $(words $(DATASET_SIZES))),$(CUB_EXECUTABLE) $(word $(i),$(DATASET_SIZES)) $(word $(i),$(DATASET_RANGE));)
 
 #CUDA
 bench-cuda: compile-cuda
 	@echo "--Running CUDA benchmark with sizes: $(DATASET_SIZES)--"
-	@$(foreach size,$(DATASET_SIZES),$(CUDA_EXECUTABLE) $(size) $(BLOCK_SIZE) $(NUM_OF_BITS) $(ELM_PER_THREAD);)
+	@$(foreach i,$(shell seq 1 $(words $(DATASET_SIZES))),$(CUDA_EXECUTABLE) $(word $(i),$(DATASET_SIZES)) $(word $(i),$(DATASET_RANGE)) $(BLOCK_SIZE) $(NUM_OF_BITS) $(ELM_PER_THREAD);)
 
 compile-cuda: $(CUDA_EXECUTABLE)
-$(CUDA_EXECUTABLE): $(CUDA_SRC)
-	$(CXX) -o $(CUDA_EXECUTABLE) $(CUDA_SRC)
-
+$(CUDA_EXECUTABLE): $(CUDA_SRC) bench-helper.o
+	$(CXX) -I. -o $(CUDA_EXECUTABLE) $(CUDA_SRC) bench-helper.o
 
 gen-futhark-data:
 	@cd $(RADIX_FUTHARK_DIR) && 
@@ -54,4 +60,5 @@ gen-futhark-data:
 clean:
 	rm -rf $(CUDA_EXECUTABLE)
 	rm -rf $(CUB_EXECUTABLE)
+	rm -rf bench-helper.o
 	rm -rf $(RADIX_FUTHARK_DIR)/*.c $(FUTHARK_EXECUTABLE)

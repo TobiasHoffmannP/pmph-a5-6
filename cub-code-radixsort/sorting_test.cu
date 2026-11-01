@@ -1,6 +1,7 @@
 //#include "../../cub-1.8.0/cub/cub.cuh"   // or equivalently <cub/device/device_histogram.cuh>
 #include "cub/cub.cuh"
 #include "helper.cu.h"
+#include "bench-helper.h"
 
 template<class Z>
 bool validateZ(Z* A, uint32_t sizeAB) {
@@ -72,16 +73,16 @@ double sortRedByKeyCUB( uint32_t* data_keys_in
 
 
 int main (int argc, char * argv[]) {
-    if (argc != 2) {
+    if (argc != 3) {
         printf("Usage: %s <size-of-array>\n", argv[0]);
         exit(1);
     }
     const uint64_t N = atoi(argv[1]);
+    const uint64_t maxValue = atoi(argv[2]);
 
-    //Allocate and Initialize Host data with random values
-    uint32_t* h_keys  = (uint32_t*) malloc(N*sizeof(uint32_t));
+    //Use bench-helper to allocate and Initialize Host data with random values
+    uint32_t* h_keys = createInput(N, maxValue);
     uint32_t* h_keys_res  = (uint32_t*) malloc(N*sizeof(uint32_t));
-    randomInitNat(h_keys, N, N/10);
 
     //Allocate and Initialize Device data
     uint32_t* d_keys_in;
