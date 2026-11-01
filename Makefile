@@ -54,8 +54,8 @@ $(CUDA_EXECUTABLE): $(CUDA_SRC) bench-helper.o
 	$(CXX) -I. -o $(CUDA_EXECUTABLE) $(CUDA_SRC) bench-helper.o
 
 gen-futhark-data:
-	@cd $(RADIX_FUTHARK_DIR) && 
-		$(foreach size, $(DATASET_SIZES), futhark dataset --i32-bounds=0:$(shell echo $$(( $(size) / 10 ))) -b -g [$(size)]i32 > data/dataset$(size).in;)
+	@mkdir -p $(RADIX_FUTHARK_DIR)/data
+	@cd $(RADIX_FUTHARK_DIR) && $(foreach i,$(shell seq 1 $(words $(DATASET_SIZES))),futhark dataset --i32-bounds=0:$(if $(word $(i),$(DATASET_RANGE)),$(word $(i),$(DATASET_RANGE)),$(lastword $(DATASET_RANGE))) -b -g [$(word $(i),$(DATASET_SIZES))]i32 > data/dataset$(word $(i),$(DATASET_SIZES)).in;)
 
 clean:
 	rm -rf $(CUDA_EXECUTABLE)
