@@ -11,58 +11,56 @@
 #define GPU_RUNS 400
 #define UINT_SIZE_BITS sizeof(unsigned int)*8
 #define BLOCK_SIZE 256
-#define ELM_PER_THREAD 23
+#define ELM_PER_THREAD 22
 #define BITS 8
+#define TILE_SIZE (ELM_PER_THREAD*BLOCK_SIZE)
+#define HIST_SIZE (1<<BITS)
+#define ITERATIONS ((32+BITS-1)/BITS)
+#define SHMEM_SIZE (HIST_SIZE*sizeof(unsigned int))
+#define SHMEM_SIZE_SORT ((2*HIST_SIZE+TILE_SIZE)*sizeof(unsigned int))
 
 __global__ void createHistogram(unsigned int* global_in, unsigned int* global_hist,
-                                unsigned int i, unsigned int hist_size, unsigned int N,
-                                unsigned int tile_size, unsigned int num_blocks) {
+                                unsigned int i, unsigned int N, unsigned int num_blocks) {
     extern __shared__ unsigned int shmem[];
     unsigned int* hist = shmem;
-    unsigned int* tile = shmem + hist_size;
+    unsigned int tile_start = blockIdx.x * TILE_SIZE;
 
-    unsigned int tile_start = blockIdx.x * tile_size;
-
-    // zero the histogram and load the tile cooperatively
-    for (unsigned int j = threadIdx.x; j < hist_size; j += blockDim.x)
+    // zero the histogram as gibberish could be in the shared memory
+    for (unsigned int j = threadIdx.x; j < HIST_SIZE; j += blockDim.x)
         hist[j] = 0;
-    for (unsigned int j = threadIdx.x; j < tile_size; j += blockDim.x) {
-       unsigned int g = tile_start + j;
-       tile[j] = (g < N) ? global_in[g] : 0;
-    }
+
     __syncthreads();
 
-    for (unsigned int j = 0; j < ELM_PER_THREAD; j++) {
-       unsigned int idx = threadIdx.x * ELM_PER_THREAD + j;
-       if (tile_start + idx < N) {
-           unsigned int elm = tile[idx];
-           unsigned int segmented_bits = (elm >> (i * BITS)) & (hist_size - 1);
+    #pragma unroll
+    for (unsigned int q = 0; q < ELM_PER_THREAD; q++) {
+       unsigned int idx = tile_start + q * BLOCK_SIZE + threadIdx.x;
+       if (idx < N) {
+           // do direct coalecced reads from global memory.
+           unsigned int segmented_bits = (global_in[idx] >> (i * BITS)) & (HIST_SIZE - 1);
            atomicAdd(&hist[segmented_bits], 1);
        }
     }
     __syncthreads();
     
     // copy histogram into global memory in column-major order to skip transposition
-    for (unsigned int j = threadIdx.x; j < hist_size; j += blockDim.x)
+    for (unsigned int j = threadIdx.x; j < HIST_SIZE; j += blockDim.x)
         global_hist[j * num_blocks + blockIdx.x] = hist[j];
 }
 
 __global__ void sortFromHistogram(unsigned int* global_in, unsigned int* global_out, unsigned int* global_hist,
           unsigned int* global_hist_scanned, unsigned int i,
-				  unsigned int hist_size, unsigned int N,
-				  unsigned int tile_size, unsigned int num_blocks) {
+				  unsigned int N, unsigned int num_blocks) {
     using BlockScan = cub::BlockScan<unsigned, BLOCK_SIZE>;
     __shared__ typename BlockScan::TempStorage scan_tmp;
 
     extern __shared__ unsigned int shmem[];
     unsigned int* tile = shmem;
-    unsigned int* s_hist = shmem + tile_size;
-    unsigned int* s_hist_scanned = shmem + tile_size + hist_size;
-
-    unsigned int tile_start = blockIdx.x * tile_size;
+    unsigned int* s_hist = shmem + TILE_SIZE;
+    unsigned int* s_hist_scanned = shmem + TILE_SIZE + HIST_SIZE;
+    unsigned int tile_start = blockIdx.x * TILE_SIZE;
 
     // copy from global to shared memory
-    for (unsigned int j = threadIdx.x; j < tile_size; j += blockDim.x) {
+    for (unsigned int j = threadIdx.x; j < TILE_SIZE; j += blockDim.x) {
         unsigned int g = tile_start + j;
         tile[j] = (g < N) ? global_in[g] : 0xFFFFFFFFu; // assumes 32-bit integers
     }
@@ -99,24 +97,24 @@ __global__ void sortFromHistogram(unsigned int* global_in, unsigned int* global_
         }
         __syncthreads();
 
-        #pragma unroll                                   // (5) reload in new order
+        #pragma unroll                                 
         for (unsigned int q = 0; q < ELM_PER_THREAD; q++)
             key[q] = tile[threadIdx.x * ELM_PER_THREAD + q];
 
         __syncthreads();
     }
-    // TODO: Step 3 in the last kernel from the hint:)
-    for (unsigned int j = threadIdx.x; j < hist_size; j += blockDim.x) {
+    // Step 3 in the last kernel from the hint:)
+    for (unsigned int j = threadIdx.x; j < HIST_SIZE; j += blockDim.x) {
         s_hist[j] = global_hist[j * num_blocks + blockIdx.x];
         s_hist_scanned[j] = global_hist_scanned[j * num_blocks + blockIdx.x];
     }
-    // BlockScan(scan_tmp).ExclusiveSum(s_hist, s_hist);
-    // __syncthreads();
 
     __syncthreads();
+    // Very simple sequential prefixsum. Does not speedup by
+    // doing it in parallel.
     if (threadIdx.x == 0) {
         unsigned int sum = 0;
-        for (unsigned int j = 0; j < hist_size; j++) {
+        for (unsigned int j = 0; j < HIST_SIZE; j++) {
             unsigned int v = s_hist[j];
             s_hist[j] = sum;
             sum += v;
@@ -124,13 +122,14 @@ __global__ void sortFromHistogram(unsigned int* global_in, unsigned int* global_
     }
     __syncthreads();
 
-    unsigned int valid = min(tile_size, N - tile_start);
+    unsigned int valid = min(TILE_SIZE, N - tile_start);
 
+    #pragma unroll
     for (unsigned int q = 0; q < ELM_PER_THREAD; q++) {
         unsigned int idx = q * BLOCK_SIZE + threadIdx.x;
         if (idx >= valid) continue;
         unsigned int elm   = tile[idx];
-        unsigned int digit = (elm >> (i * BITS)) & (hist_size - 1);
+        unsigned int digit = (elm >> (i * BITS)) & (HIST_SIZE - 1);
         unsigned int global_dest = s_hist_scanned[digit] + (idx - s_hist[digit]);
         global_out[global_dest] = elm;
     }    
@@ -142,7 +141,7 @@ int main(int argc, char** argv) {
     
     { // reading the number of elements 
       if (argc != 3) { 
-        printf("Num Args is: %d instead of 4. Exiting!\n", argc); 
+        printf("Num Args is: %d instead of 3. Exiting!\n", argc); 
         exit(1);
       }
 
@@ -157,16 +156,10 @@ int main(int argc, char** argv) {
       }
     }
 
-    unsigned int TILE_SIZE = ELM_PER_THREAD*BLOCK_SIZE;
     unsigned int NUM_BLOCKS = (N + TILE_SIZE - 1) / TILE_SIZE;
-    unsigned int HIST_SIZE = pow(2,BITS);
     unsigned int HIST_ELMS = NUM_BLOCKS*HIST_SIZE;
     size_t HIST_BYTES = HIST_ELMS*sizeof(unsigned int);
-    unsigned int ITERATIONS = (unsigned int)ceil(UINT_SIZE_BITS/BITS);
-    unsigned int shmem_size = (HIST_SIZE + TILE_SIZE) * sizeof(unsigned int);
-    unsigned int shmem_size_sort = (2*HIST_SIZE + TILE_SIZE) * sizeof(unsigned int);
-
-    //printf("TILE_SIZE: %d, NUM_BLOCK: %d, HIST_SIZE: %d, G_HIST_SIZE: %d, ITTERS: %d\n", TILE_SIZE, NUM_BLOCKS, HIST_SIZE, HIST_ELMS, ITERATIONS);
+    
     // use the first CUDA device:
     cudaSetDevice(0);
 
@@ -189,14 +182,14 @@ int main(int argc, char** argv) {
 
     // Dry run
     for (unsigned int i = 0; i < ITERATIONS; i++) {
-        createHistogram<<<NUM_BLOCKS, BLOCK_SIZE, shmem_size>>>(
-            d_in, d_hist, i, HIST_SIZE, N, TILE_SIZE, NUM_BLOCKS);
+        createHistogram<<<NUM_BLOCKS, BLOCK_SIZE, SHMEM_SIZE>>>(
+            d_in, d_hist, i, N, NUM_BLOCKS);
         gpuAssert(cudaGetLastError());
 
         cub::DeviceScan::ExclusiveSum(d_temp, temp_bytes, d_hist, d_hist_scanned, HIST_ELMS);
 
-        sortFromHistogram<<<NUM_BLOCKS, BLOCK_SIZE, shmem_size_sort>>>(
-            d_in, d_out, d_hist, d_hist_scanned, i, HIST_SIZE, N, TILE_SIZE, NUM_BLOCKS);
+        sortFromHistogram<<<NUM_BLOCKS, BLOCK_SIZE, SHMEM_SIZE_SORT>>>(
+            d_in, d_out, d_hist, d_hist_scanned, i, N, NUM_BLOCKS);
         gpuAssert(cudaGetLastError());
 
         std::swap(d_in, d_out);
@@ -211,20 +204,20 @@ int main(int argc, char** argv) {
     float total_ms = 0.0f;
 
     for (int k = 0; k < GPU_RUNS; k++) {
-        // restore random input (not timed)
+        // restore data on device
         cudaMemcpy(d_in, h_in, N * sizeof(unsigned int), cudaMemcpyHostToDevice);
         cudaDeviceSynchronize();
 
         cudaEventRecord(ev_start);
         for (unsigned int i = 0; i < ITERATIONS; i++) {
-            createHistogram<<<NUM_BLOCKS, BLOCK_SIZE, shmem_size>>>(
-                d_in, d_hist, i, HIST_SIZE, N, TILE_SIZE, NUM_BLOCKS);
+            createHistogram<<<NUM_BLOCKS, BLOCK_SIZE, SHMEM_SIZE>>>(
+                d_in, d_hist, i, N, NUM_BLOCKS);
             gpuAssert(cudaGetLastError());
 
             cub::DeviceScan::ExclusiveSum(d_temp, temp_bytes, d_hist, d_hist_scanned, HIST_ELMS);
 
-            sortFromHistogram<<<NUM_BLOCKS, BLOCK_SIZE, shmem_size_sort>>>(
-                d_in, d_out, d_hist, d_hist_scanned, i, HIST_SIZE, N, TILE_SIZE, NUM_BLOCKS);
+            sortFromHistogram<<<NUM_BLOCKS, BLOCK_SIZE, SHMEM_SIZE_SORT>>>(
+                d_in, d_out, d_hist, d_hist_scanned, i, N, NUM_BLOCKS);
             gpuAssert(cudaGetLastError());
 
             std::swap(d_in, d_out);
@@ -260,6 +253,7 @@ int main(int argc, char** argv) {
     free(h_in);
     free(h_out);
     cudaFree(d_in);
+    cudaFree(d_out);
     cudaFree(d_hist);
     cudaFree(d_hist_scanned);
     cudaFree(d_temp);
