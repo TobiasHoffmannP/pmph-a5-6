@@ -19,6 +19,30 @@
 #define SHMEM_SIZE (HIST_SIZE*sizeof(unsigned int))
 #define SHMEM_SIZE_SORT ((2*HIST_SIZE+TILE_SIZE)*sizeof(unsigned int))
 
+#define TDIM 32
+#define TROWS 8  
+
+// in: rows x cols (row-major)  ->  out: cols x rows (row-major)
+__global__ void transposeKernel(const unsigned int* in, unsigned int* out,
+                                unsigned int rows, unsigned int cols) {
+    __shared__ unsigned int tile[TDIM][TDIM + 1];   // +1: no bank conflicts on column access
+
+    // read a 32x32 tile, coalesced along the input rows
+    unsigned int x = blockIdx.x * TDIM + threadIdx.x;   // input column
+    unsigned int y = blockIdx.y * TDIM + threadIdx.y;   // input row
+    for (unsigned int k = 0; k < TDIM; k += TROWS)
+        if (x < cols && y + k < rows)
+            tile[threadIdx.y + k][threadIdx.x] = in[(y + k) * cols + x];
+    __syncthreads();
+
+    // write the tile transposed, coalesced along the output rows
+    x = blockIdx.y * TDIM + threadIdx.x;                // output column (= input row)
+    y = blockIdx.x * TDIM + threadIdx.y;                // output row    (= input column)
+    for (unsigned int k = 0; k < TDIM; k += TROWS)
+        if (x < rows && y + k < cols)
+            out[(y + k) * rows + x] = tile[threadIdx.x][threadIdx.y + k];
+}
+
 __global__ void createHistogram(unsigned int* global_in, unsigned int* global_hist,
                                 unsigned int i, unsigned int N, unsigned int num_blocks) {
     extern __shared__ unsigned int shmem[];
@@ -44,7 +68,7 @@ __global__ void createHistogram(unsigned int* global_in, unsigned int* global_hi
     
     // copy histogram into global memory in column-major order to skip transposition
     for (unsigned int j = threadIdx.x; j < HIST_SIZE; j += blockDim.x)
-        global_hist[j * num_blocks + blockIdx.x] = hist[j];
+        global_hist[blockIdx.x * HIST_SIZE + j] = hist[j];   // NOT j * num_blocks + blockIdx.x
 }
 
 __global__ void sortFromHistogram(unsigned int* global_in, unsigned int* global_out, unsigned int* global_hist,
@@ -104,9 +128,15 @@ __global__ void sortFromHistogram(unsigned int* global_in, unsigned int* global_
         __syncthreads();
     }
     // Step 3 in the last kernel from the hint:)
+    // for (unsigned int j = threadIdx.x; j < HIST_SIZE; j += blockDim.x) {
+    //     s_hist[j] = global_hist[j * num_blocks + blockIdx.x];
+    //     s_hist_scanned[j] = global_hist_scanned[j * num_blocks + blockIdx.x];
+    // }
+
+    // both histograms are now block-major: row blockIdx.x, 256 consecutive words → coalesced
     for (unsigned int j = threadIdx.x; j < HIST_SIZE; j += blockDim.x) {
-        s_hist[j] = global_hist[j * num_blocks + blockIdx.x];
-        s_hist_scanned[j] = global_hist_scanned[j * num_blocks + blockIdx.x];
+        s_hist[j]         = global_hist[blockIdx.x * HIST_SIZE + j];
+        s_hist_scanned[j] = global_hist_scanned[blockIdx.x * HIST_SIZE + j];
     }
 
     __syncthreads();
@@ -167,7 +197,8 @@ int main(int argc, char** argv) {
     unsigned int* h_in  = (unsigned int*)createInput(N, (unsigned long)BOUND);
     unsigned int* h_out = (unsigned int*) malloc(N*sizeof(unsigned int));
 
-    unsigned int *d_in, *d_out, *d_hist, *d_hist_scanned;
+    unsigned int *d_in, *d_out, *d_hist, *d_hist_scanned, *d_hist_rows;
+    cudaMalloc(&d_hist_rows, HIST_BYTES);
     cudaMalloc(&d_in,  N * sizeof(unsigned int));
     cudaMalloc(&d_out, N * sizeof(unsigned int));
     cudaMalloc(&d_hist,         HIST_BYTES);
@@ -179,19 +210,34 @@ int main(int argc, char** argv) {
     cudaMalloc(&d_temp, temp_bytes);
 
     cudaMemcpy(d_in, h_in, N * sizeof(unsigned int), cudaMemcpyHostToDevice);
+    dim3 tBlock(TDIM, TROWS);
+    // ② input is NUM_BLOCKS x HIST_SIZE  → x over HIST_SIZE columns, y over NUM_BLOCKS rows
+    dim3 tGridToDigit((HIST_SIZE  + TDIM - 1) / TDIM,
+                      (NUM_BLOCKS + TDIM - 1) / TDIM);
 
+    // ④ input is HIST_SIZE x NUM_BLOCKS  → x over NUM_BLOCKS columns, y over HIST_SIZE rows
+    dim3 tGridToBlock((NUM_BLOCKS + TDIM - 1) / TDIM,
+                      (HIST_SIZE  + TDIM - 1) / TDIM);
     // Dry run
     for (unsigned int i = 0; i < ITERATIONS; i++) {
         createHistogram<<<NUM_BLOCKS, BLOCK_SIZE, SHMEM_SIZE>>>(
-            d_in, d_hist, i, N, NUM_BLOCKS);
+            d_in, d_hist_rows, i, N, NUM_BLOCKS);                          // ① raw, block-major (kept)
         gpuAssert(cudaGetLastError());
 
-        cub::DeviceScan::ExclusiveSum(d_temp, temp_bytes, d_hist, d_hist_scanned, HIST_ELMS);
+        transposeKernel<<<tGridToDigit, tBlock>>>(
+            d_hist_rows, d_hist, NUM_BLOCKS, HIST_SIZE);                   // ② → digit-major
+        gpuAssert(cudaGetLastError());
+
+        gpuAssert(cub::DeviceScan::ExclusiveSum(
+            d_temp, temp_bytes, d_hist, d_hist_scanned, HIST_ELMS));       // ③ scan
+
+        transposeKernel<<<tGridToBlock, tBlock>>>(
+            d_hist_scanned, d_hist, HIST_SIZE, NUM_BLOCKS);                // ④ scanned → block-major
+        gpuAssert(cudaGetLastError());
 
         sortFromHistogram<<<NUM_BLOCKS, BLOCK_SIZE, SHMEM_SIZE_SORT>>>(
-            d_in, d_out, d_hist, d_hist_scanned, i, N, NUM_BLOCKS);
+            d_in, d_out, d_hist_rows, d_hist, i, N, NUM_BLOCKS);           // raw rows, scanned rows
         gpuAssert(cudaGetLastError());
-
         std::swap(d_in, d_out);
     }
     cudaDeviceSynchronize();
@@ -211,15 +257,23 @@ int main(int argc, char** argv) {
         cudaEventRecord(ev_start);
         for (unsigned int i = 0; i < ITERATIONS; i++) {
             createHistogram<<<NUM_BLOCKS, BLOCK_SIZE, SHMEM_SIZE>>>(
-                d_in, d_hist, i, N, NUM_BLOCKS);
+                d_in, d_hist_rows, i, N, NUM_BLOCKS);                          // ① raw, block-major (kept)
             gpuAssert(cudaGetLastError());
 
-            cub::DeviceScan::ExclusiveSum(d_temp, temp_bytes, d_hist, d_hist_scanned, HIST_ELMS);
+            transposeKernel<<<tGridToDigit, tBlock>>>(
+                d_hist_rows, d_hist, NUM_BLOCKS, HIST_SIZE);                   // ② → digit-major
+            gpuAssert(cudaGetLastError());
+
+            gpuAssert(cub::DeviceScan::ExclusiveSum(
+                d_temp, temp_bytes, d_hist, d_hist_scanned, HIST_ELMS));       // ③ scan
+
+            transposeKernel<<<tGridToBlock, tBlock>>>(
+                d_hist_scanned, d_hist, HIST_SIZE, NUM_BLOCKS);                // ④ scanned → block-major
+            gpuAssert(cudaGetLastError());
 
             sortFromHistogram<<<NUM_BLOCKS, BLOCK_SIZE, SHMEM_SIZE_SORT>>>(
-                d_in, d_out, d_hist, d_hist_scanned, i, N, NUM_BLOCKS);
+                d_in, d_out, d_hist_rows, d_hist, i, N, NUM_BLOCKS);           // raw rows, scanned rows
             gpuAssert(cudaGetLastError());
-
             std::swap(d_in, d_out);
         }
         cudaEventRecord(ev_stop);
