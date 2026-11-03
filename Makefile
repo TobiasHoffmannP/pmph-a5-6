@@ -28,7 +28,7 @@ bench-helper.o: bench-helper.cu bench-helper.h
 	$(CXX) -c bench-helper.cu -o bench-helper.o
 
 # Futhark
-bench-futhark:
+bench-futhark: gen-futhark-data
 	@echo "--Running futhark benchmark with sizes: $(DATASET_SIZES)--"
 	@futhark bench --backend=cuda $(FUTHARK_SRC)
 
