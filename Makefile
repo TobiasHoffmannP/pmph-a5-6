@@ -18,8 +18,8 @@ FUTHARK_EXECUTABLE = $(RADIX_FUTHARK_DIR)/radix
 BENCH_HELPER = bench-helper.cu
 BENCH_HELPER_EXECUTABLE = bench-helper
 
-DATASET_SIZES = 10 100 10000 1000000 16447230
-DATASET_RANGE = 10 100 10000 10000 100000 # Max possible value for the elements in the datasets [0:DATASET_RANGE]
+DATASET_SIZES = 100 1000 4000 16000 64000 1000000 4000000 64000000
+DATASET_RANGE = 1000 1000 1000 1000 1000 1000 1000 1000 # Max possible value for the elements in the datasets [0:DATASET_RANGE]
 
 benchmark: bench-futhark bench-cub bench-cuda
 
